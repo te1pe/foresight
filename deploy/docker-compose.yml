@@ -1,0 +1,100 @@
+name: foresight
+
+services:
+  postgres:
+    # Major version pinned: a new major changes the on-disk format, so it
+    # must be an explicit upgrade, not a side effect of pulling "latest".
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: foresight
+      POSTGRES_PASSWORD: foresight
+      POSTGRES_DB: foresight
+    ports:
+      # 5433 on the host: 5432 is often taken by a natively installed PostgreSQL.
+      - "5433:5432"
+    volumes:
+      # Since PostgreSQL 18 the image keeps data under a versioned
+      # subdirectory, so the volume is mounted one level up.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U foresight -d foresight"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redpanda:
+    # Pinned for the same reason as PostgreSQL: storage format and config
+    # defaults change between releases.
+    image: redpandadata/redpanda:v26.2.4
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --default-log-level=warn
+      # Two listeners: containers reach the broker as redpanda:9092, while
+      # services running natively on the Mac use localhost:19092. Each client
+      # gets back the address advertised for the listener it connected to.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      # Topics are created explicitly (make topic-create) with a chosen
+      # partition count; a typo in a topic name must fail, not create a topic.
+      - --set
+      - redpanda.auto_create_topics_enabled=false
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  clickhouse:
+    # 26.3 is an LTS line; pinned like the other images.
+    image: clickhouse/clickhouse-server:26.3-alpine
+    environment:
+      CLICKHOUSE_USER: foresight
+      CLICKHOUSE_PASSWORD: foresight
+      CLICKHOUSE_DB: foresight
+    ports:
+      - "9000:9000"   # native protocol: the Go driver and goose
+      - "8123:8123"   # HTTP: curl and ad-hoc queries
+    # ClickHouse keeps a file descriptor per column file of every part;
+    # Docker's default limit is too low for its startup check.
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+    healthcheck:
+      # 127.0.0.1, not localhost: in the image localhost resolves to ::1
+      # first, and the server listens on IPv4 only.
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:8.8-alpine
+    # Append-only file: the notification dedup keys must survive a Redis
+    # restart, otherwise every recently sent alert could be sent again.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:
+  redpanda:
+  clickhouse:
+  redis:
